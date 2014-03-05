@@ -2,6 +2,39 @@ function equals(a, b) {
   return !!(EJSON.stringify(a) === EJSON.stringify(b));
 }
 
+if (typeof Accounts !== 'undefined') {
+  Meteor.users.remove({});
+  Accounts.createUser({
+    username: 'test',
+    email: 'test@test.com',
+    password: '1234'
+  });
+}
+
+HTTP.methods({
+  'login': {
+    method: function(data) {
+      console.log(this.basicAuth);
+      console.log(this.authToken);
+      console.log('login is called - ' + data + '  ' + this.method + ' UserID: ' + this.userId);
+      this.addHeader('Set-Cookie', 'Dont use cookies; Max-Age=3600; Version=1');
+      return this.method;
+    },
+    useAuth: true
+  },
+  'test': {
+    method: function(data) {
+      console.log(this.basicAuth);
+      console.log(this.authToken);
+      console.log('test is called - ' + data + '  ' + this.method + ' UserID: ' + this.userId);
+      if (!this.userId)
+        throw new Meteor.Error(403, 'Not authenticated');
+      return this.method;
+    },
+    useAuth: true
+  }
+});
+
 Tinytest.add('http-methods - test environment', function(test) {
   test.isTrue(typeof _methodHTTP !== 'undefined', 'test environment not initialized _methodHTTP');
   test.isTrue(typeof HTTP !== 'undefined', 'test environment not initialized _methodHTTP');
@@ -72,6 +105,8 @@ Tinytest.add('http-methods - addToMethodTree', function(test) {
 });
 
 Tinytest.add('http-methods - getMethod', function(test) {
+  var original = _methodHTTP.methodTree;
+  _methodHTTP.methodTree = {};
   // Basic tests
   test.equal(EJSON.stringify(_methodHTTP.getMethod('')), 'null', 'getMethod failed');
   test.equal(EJSON.stringify(_methodHTTP.getMethod('//')), 'null', 'getMethod failed');
@@ -95,6 +130,7 @@ Tinytest.add('http-methods - getMethod', function(test) {
   test.equal(EJSON.stringify(_methodHTTP.getMethod('login/bar/foo')), '{"name":"/login/:value/foo/","params":{"name":"bar"}}', 'getMethod failed');
   test.equal(EJSON.stringify(_methodHTTP.getMethod('login/foo')), '{"name":"/login/foo/","params":{}}', 'getMethod failed');
 
+  _methodHTTP.methodTree = original;
 });
 
 //Test API:

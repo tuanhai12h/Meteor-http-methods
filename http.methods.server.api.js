@@ -7,6 +7,12 @@ PUT /note/:id
 DELETE /note/:id
 
 */
+
+// Weak dependency on the accounts-base package
+Accounts = Package['accounts-base'] && Package['accounts-base'].Accounts;
+
+// Weak depencendy on the http package - we extend the namespace - we should
+// prop get our own namespace like XHTTP or something
 HTTP = Package.http && Package.http.HTTP || {};
 
 var url = Npm.require('url');
@@ -150,6 +156,11 @@ _methodHTTP.getMethod = function(name) {
 // is valid and not expired
 _methodHTTP.getUserId = function() {
   var self = this;
+  // Cant really do much without the Accounts package
+  if (typeof Accounts === 'undefined')
+    console.log('Accounts not installed??');
+  if (typeof Accounts === 'undefined')
+    return null;
 
   // // Get ip, x-forwarded-for can be comma seperated ips where the first is the
   // // client ip
@@ -160,29 +171,88 @@ _methodHTTP.getUserId = function() {
   //         self.req.connection.remoteAddress;
 
   // Check authentication
-  var userToken = self.query.token;
+  var authToken = self.authToken;
+  var basicAuth = self.basicAuth;
 
   // Check if we are handed strings
   try {
-    userToken && check(userToken, String);
+    authToken && check(authToken, String);
   } catch(err) {
     throw new Meteor.Error(404, 'Error user token and id not of type strings, Error: ' + (err.stack || err.message));
   }
 
   // Set the this.userId
-  if (userToken) {
+  if (typeof authToken !== 'undefined') {
     // Look up user to check if user exists and is loggedin via token
+    console.log('User token...');
     var user = Meteor.users.findOne({
         $or: [
-          {'services.resume.loginTokens.hashedToken': Accounts._hashLoginToken(userToken)},
-          {'services.resume.loginTokens.token': userToken}
+          {'services.resume.loginTokens.hashedToken': Accounts._hashLoginToken(authToken)},
+          {'services.resume.loginTokens.token': authToken}
         ]
       });
     // TODO: check 'services.resume.loginTokens.when' to have the token expire
 
     // Set the userId in the scope
     return user && user._id;
-  }
+  } else if (typeof basicAuth !== 'undefined') {
+    // We try to authenticate using the basicAuth and the password package.
+    // If we encounter an error etc. we dont pop the login window - simply
+    // throw errors instead.
+    // We dont use resume tokens - we could set a resume token by updating the
+    // user and setting a cookie in the headers. Any ways we provide the tools
+    // making it possible to create a login method - that could generate a token
+    // and return it to the client.
+    // If x-auth headers are set we dont use basicAuth.
+    //
+    // XXX: do we know if we are on https? we could be behind a proxy etc.
+    // If we could we should not allow the user to send plain-text passwords
+
+    // Check the basicAuth object that username and password are valid strings
+    try {
+      check(basicAuth, {username: String, password: String});
+    } catch(err) {
+      throw new Meteor.Error(400, 'Bad request');
+    }
+
+    // Create the user selector - we allow both use of username and email
+    // XXX: Should this only be username?
+    var selector = {
+      $or: [
+        { 'username': basicAuth.username },
+        { 'emails.address': basicAuth.username }
+      ]
+    };
+
+    // Try to find the user
+    var user = Meteor.users.findOne(selector);
+
+    // If not found then throw an error
+    if (!user)
+      throw new Meteor.Error(403, "User not found");
+
+    // Check that the user object contains password
+    if (!user.services || !user.services.password ||
+        !user.services.password.srp)
+      throw new Meteor.Error(403, "User has no password set");
+
+    // Just check the verifier output when the same identity and salt
+    // are passed. Don't bother with a full exchange.
+    var verifier = user.services.password.srp;
+
+    // Calculate new verifier
+    var newVerifier = SRP.generateVerifier(basicAuth.password, {
+      identity: verifier.identity, salt: verifier.salt});
+
+    // Match the two verifiers
+    if (verifier.verifier !== newVerifier.verifier) {
+      throw new Meteor.Error(403, "Incorrect password");
+    } else {
+      // If we have a match then return the user id
+      return user && user._id;
+    }
+
+  } // EO basicAuth
 
   return null;
 };
@@ -237,7 +307,8 @@ HTTP.methods = function(newMethods) {
           var uniObj = {};
           if (typeof func === 'function') {
             uniObj = {
-              'auth': _methodHTTP.getUserId,
+              'useAuth': false,
+              'authFunction': _methodHTTP.getUserId,
               'POST': func,
               'PUT': func,
               'GET': func,
@@ -245,7 +316,8 @@ HTTP.methods = function(newMethods) {
             };
           } else {
             uniObj = {
-              'auth': func.auth || _methodHTTP.getUserId,
+              'useAuth': func.useAuth,
+              'authFunction': func.authFunction || _methodHTTP.getUserId,
               'POST': func.post || func.method,
               'PUT': func.put || func.method,
               'GET': func.get || func.method,
@@ -341,6 +413,7 @@ var requestHandler = function(req, res, callback) {
 // Handle the actual connection
 WebApp.connectHandlers.use(function(req, res, next) {
 
+
   // Check to se if this is a http method call
   var method = _methodHTTP.getMethod(req._parsedUrl.pathname);
 
@@ -349,151 +422,188 @@ WebApp.connectHandlers.use(function(req, res, next) {
     return next();
   }
 
-  requestHandler(req, res, function(data) {
-    var methodReference = method.name;
+  var methodReference = method.name;
 
-    // If methodsHandler not found or somehow the methodshandler is not a
-    // function then return a 404
-    if (typeof _methodHTTP.methodHandlers[methodReference] === 'undefined') {
-      sendError(res, 404, 'Error HTTP method handler "' + methodReference + '" is not found');
-      return;
+  var methodObject = _methodHTTP.methodHandlers[methodReference];
+
+  // If methodsHandler not found or somehow the methodshandler is not a
+  // function then return a 404
+  if (typeof methodObject === 'undefined') {
+    sendError(res, 404, 'Error HTTP method handler "' + methodReference + '" is not found');
+    return;
+  }
+
+  // Rig the basicAuth object
+  var basicAuth;
+
+  // Rig the check method - this is a very simple method - we dont want to
+  // trigger the popup login dialog
+  var handleBasicAuth = WebApp.__basicAuth__(function(u, p) {
+    // Make sure user and password are non empty string
+    if (u === ''+u && p === ''+p && u !== '' && p !== '') {
+      // Update the basicAuth object
+      basicAuth = {
+        username: u,
+        password: p
+      };
     }
+    return true;
+    // XXX: should the realm text be configurable? - We dont actually use this
+  }, 'Authorization Required');
 
-    // Set fiber scope
-    var fiberScope = {
-      // Pointers to Request / Response
-      req: req,
-      res: res,
-      // Request / Response helpers
-      statusCode: 200,
-      method: req.method,
-      // Headers for response
-      headers: {
-        'Content-Type': 'text/html'  // Set default type
-      },
-      // Arguments
-      data: data,
-      query: req.query,
-      params: method.params,
-      // Method reference
-      reference: methodReference,
-      methodObject: _methodHTTP.methodHandlers[methodReference],
-    };
+  var dontHandleBasicAuth = function(req, res, callback) { callback(); };
 
-    // Helper functions this scope
-    Fiber = Npm.require('fibers');
-    runServerMethod = Fiber(function(self) {
-      // We fetch methods data from methodsHandler, the handler uses the this.addItem()
-      // function to populate the methods, this way we have better check control and
-      // better error handling + messages
+  var authHandle = (methodObject.useAuth)? handleBasicAuth: dontHandleBasicAuth;
 
-      // The scope for the user methodObject callbacks
-      var thisScope = {
-        // The user whos id and token was used to run this method, if set/found
-        userId: null,
-        // The id of the data
-        _id: null,
-        // Set the query params ?token=1&id=2 -> { token: 1, id: 2 }
-        query: self.query,
-        // Set params /foo/:name/test/:id -> { name: '', id: '' }
-        params: self.params,
-        // Method GET, PUT, POST, DELETE
-        method: self.method,
-        // User agent
-        userAgent: req.headers['user-agent'],
-        // All request headers
-        requestHeaders: req.headers,
-        // Set the userId
-        setUserId: function(id) {
-          this.userId = id;
+  // The checker will set the basicAuth if present
+  authHandle(req, res, function() {
+
+    requestHandler(req, res, function(data) {
+
+      // Set fiber scope
+      var fiberScope = {
+        // Pointers to Request / Response
+        req: req,
+        res: res,
+        // Request / Response helpers
+        statusCode: 200,
+        method: req.method,
+        // Headers for response
+        headers: {
+          'Content-Type': 'text/html'  // Set default type
         },
-        // We dont simulate / run this on the client at the moment
-        isSimulation: false,
-        // Run the next method in a new fiber - This is default at the moment
-        unblock: function() {},
-        // Set the content type in header, defaults to text/html?
-        setContentType: function(type) {
-          self.headers['Content-Type'] = type;
-        },
-        setStatusCode: function(code) {
-          self.statusCode = code;
-        },
-        addHeader: function(key, value) {
-          self.headers[key] = value;
-        }
+        // Arguments
+        data: data,
+        query: req.query,
+        params: method.params,
+        // Method reference
+        reference: methodReference,
+        methodObject: methodObject,
+        // basic auth
+        basicAuth: basicAuth,
+        authToken: req.headers['x-auth'] || req.query.token
       };
 
-      var methodCall = self.methodObject[self.method];
+      // Helper functions this scope
+      Fiber = Npm.require('fibers');
+      runServerMethod = Fiber(function(self) {
+        // We fetch methods data from methodsHandler, the handler uses the this.addItem()
+        // function to populate the methods, this way we have better check control and
+        // better error handling + messages
 
-      // If the method call is set for the POST/PUT/GET or DELETE then run the
-      // respective methodCall if its a function
-      if (typeof methodCall === 'function') {
-
-        // Get the userId - This is either set as a method specific handler and
-        // will allways default back to the builtin getUserId handler
-        try {
-          // Try to set the userId
-          thisScope.userId = self.methodObject.auth.apply(self);
-        } catch(err) {
-          sendError(res, err.error, (err.message || err.stack));
-          return;
-        }
-
-        // Get the result of the methodCall
-        var result;
-        // Get a result back to send to the client
-        try {
-          result = methodCall.apply(thisScope, [self.data]) || '';
-        } catch(err) {
-          if (err instanceof Meteor.Error) {
-            // Return controlled error
-            sendError(res, err.error, err.message);
-          } else {
-            // Return error trace - this is not intented
-            sendError(res, 503, 'Error in method "' + self.reference + '", Error: ' + (err.stack || err.message) );
+        // The scope for the user methodObject callbacks
+        var thisScope = {
+          // The user whos id and token was used to run this method, if set/found
+          userId: null,
+          // The id of the data
+          _id: null,
+          // Set the query params ?token=1&id=2 -> { token: 1, id: 2 }
+          query: self.query,
+          // Set params /foo/:name/test/:id -> { name: '', id: '' }
+          params: self.params,
+          // Method GET, PUT, POST, DELETE
+          method: self.method,
+          // basic auth
+          basicAuth: self.basicAuth,
+          // x-auth token
+          authToken: self.authToken,
+          // User agent
+          userAgent: req.headers['user-agent'],
+          // All request headers
+          requestHeaders: req.headers,
+          // Set the userId
+          setUserId: function(id) {
+            this.userId = id;
+          },
+          // We dont simulate / run this on the client at the moment
+          isSimulation: false,
+          // Run the next method in a new fiber - This is default at the moment
+          unblock: function() {},
+          // Set the content type in header, defaults to text/html?
+          setContentType: function(type) {
+            self.headers['Content-Type'] = type;
+          },
+          setStatusCode: function(code) {
+            self.statusCode = code;
+          },
+          addHeader: function(key, value) {
+            self.headers[key] = value;
           }
-          return;
-        }
+        };
 
-        // If OK / 200 then Return the result
-        if (self.statusCode === 200) {
-          var resultBuffer = new Buffer(result);
-          // Check if user wants to overwrite content length for some reason?
-          if (typeof self.headers['Content-Length'] === 'undefined') {
-            self.headers['Content-Length'] = resultBuffer.length;
+        var methodCall = self.methodObject[self.method];
+
+        // If the method call is set for the POST/PUT/GET or DELETE then run the
+        // respective methodCall if its a function
+        if (typeof methodCall === 'function') {
+
+          // Get the userId - This is either set as a method specific handler and
+          // will allways default back to the builtin getUserId handler
+          try {
+            // Try to set the userId
+            thisScope.userId = self.methodObject.authFunction.apply(self);
+          } catch(err) {
+            sendError(res, err.error, (err.message || err.stack));
+            return;
           }
-          // Set headers
-          _.each(self.headers, function(value, key) {
-            self.res.setHeader(key, value);
-          });
-          // End response
-          self.res.end(resultBuffer);
-        } else {
-          // Set headers
-          _.each(self.headers, function(value, key) {
-            // If value is defined then set the header, this allows for unsetting
-            // the default content-type
-            if (typeof value !== 'undefined')
+
+          // Get the result of the methodCall
+          var result;
+          // Get a result back to send to the client
+          try {
+            result = methodCall.apply(thisScope, [self.data]) || '';
+          } catch(err) {
+            if (err instanceof Meteor.Error) {
+              // Return controlled error
+              sendError(res, err.error, err.message);
+            } else {
+              // Return error trace - this is not intented
+              sendError(res, 503, 'Error in method "' + self.reference + '", Error: ' + (err.stack || err.message) );
+            }
+            return;
+          }
+
+          // If OK / 200 then Return the result
+          if (self.statusCode === 200) {
+            var resultBuffer = new Buffer(result);
+            // Check if user wants to overwrite content length for some reason?
+            if (typeof self.headers['Content-Length'] === 'undefined') {
+              self.headers['Content-Length'] = resultBuffer.length;
+            }
+            // Set headers
+            _.each(self.headers, function(value, key) {
               self.res.setHeader(key, value);
-          });
-          // Allow user to alter the status code and send a message
-          sendError(res, self.statusCode, result);
+            });
+            // End response
+            self.res.end(resultBuffer);
+          } else {
+            // Set headers
+            _.each(self.headers, function(value, key) {
+              // If value is defined then set the header, this allows for unsetting
+              // the default content-type
+              if (typeof value !== 'undefined')
+                self.res.setHeader(key, value);
+            });
+            // Allow user to alter the status code and send a message
+            sendError(res, self.statusCode, result);
+          }
+
+        } else {
+          sendError(res, 404, 'Service not found');
         }
 
-      } else {
-        sendError(res, 404, 'Service not found');
+
+      });
+      // Run http methods handler
+      try {
+        runServerMethod.run(fiberScope);
+      } catch(err) {
+        sendError(res, 500, 'Error running the server http method handler, Error: ' + (err.stack || err.message));
       }
 
+    }); // EO Request handler
 
-    });
-    // Run http methods handler
-    try {
-      runServerMethod.run(fiberScope);
-    } catch(err) {
-      sendError(res, 500, 'Error running the server http method handler, Error: ' + (err.stack || err.message));
-    }
-
-  }); // EO Request handler
+  }); // EO check auth headers sent or not
 
 
 });

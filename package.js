@@ -4,9 +4,11 @@ Package.describe({
 
 Package.on_use(function(api) {
   'use strict';
-  api.use(['webapp', 'underscore', 'ejson'], 'server');
+  api.use(['webapp', 'underscore', 'ejson', 'srp'], 'server');
 
   api.use('http', { weak: true });
+
+  api.use('accounts-base', ['client', 'server'], { weak: true });
 
   api.export && api.export('HTTP');
 
@@ -18,10 +20,12 @@ Package.on_use(function(api) {
 });
 
 Package.on_test(function (api) {
+  api.use(['test-helpers', 'accounts-password'], ['server', 'client']);
   api.use('http-methods', ['server']);
-  api.use('test-helpers', 'server');
+  api.use('http', 'client');
   api.use(['tinytest', 'underscore', 'ejson', 'ordered-dict',
            'random', 'deps']);
 
-  api.add_files('http.methods.tests.js', 'server');
+  api.add_files('tests/client-tests.js', 'client');
+  api.add_files('tests/server-tests.js', 'server');
 });
