@@ -16,6 +16,7 @@ Accounts = Package['accounts-base'] && Package['accounts-base'].Accounts;
 HTTP = Package.http && Package.http.HTTP || {};
 
 var url = Npm.require('url');
+var stream = Npm.require('stream');
 
 // Primary local test scope
 _methodHTTP = {};
@@ -144,7 +145,8 @@ _methodHTTP.getMethod = function(name) {
   if (typeof reference !== 'undefined') {
     return {
       name: reference.name,
-      params: _methodHTTP.createObject(reference.params, values)
+      params: _methodHTTP.createObject(reference.params, values),
+      handle: _methodHTTP.methodHandlers[reference.name]
     };
   } else {
     // Did not get any reference to the method
@@ -290,6 +292,7 @@ HTTP.methods = function(newMethods) {
           //   put:
           //   get:
           //   delete:
+          //   head:
           // }
 
           /*
@@ -300,6 +303,7 @@ HTTP.methods = function(newMethods) {
             put:
             get:
             delete:
+            head:
           }
           This way we have a uniform reference
           */
@@ -309,19 +313,23 @@ HTTP.methods = function(newMethods) {
             uniObj = {
               'useAuth': false,
               'authFunction': _methodHTTP.getUserId,
+              'stream': false,
               'POST': func,
               'PUT': func,
               'GET': func,
-              'DELETE': func
+              'DELETE': func,
+              'HEAD': func
             };
           } else {
             uniObj = {
               'useAuth': func.useAuth,
               'authFunction': func.authFunction || _methodHTTP.getUserId,
+              'stream': func.stream || false,
               'POST': func.post || func.method,
               'PUT': func.put || func.method,
               'GET': func.get || func.method,
-              'DELETE': func.delete || func.method
+              'DELETE': func.delete || func.method,
+              'HEAD': func.head || func.get || func.method
             };
           }
 
@@ -410,6 +418,16 @@ var requestHandler = function(req, res, callback) {
 
 };
 
+// This is the simplest handler - it simply passes req stream as data to the
+// method
+var streamHandler = function(req, res, callback) {
+  try {
+    callback();
+  } catch(err) {
+    sendError(res, 500, 'Error in requestHandler callback, Error: ' + (err.stack || err.message) );
+  }
+};
+
 // Handle the actual connection
 WebApp.connectHandlers.use(function(req, res, next) {
 
@@ -455,10 +473,18 @@ WebApp.connectHandlers.use(function(req, res, next) {
 
   var authHandle = (methodObject.useAuth)? handleBasicAuth: dontHandleBasicAuth;
 
+  var dataHandle = (method.handle && method.handle.stream)?streamHandler:requestHandler;
+
   // The checker will set the basicAuth if present
   authHandle(req, res, function() {
 
-    requestHandler(req, res, function(data) {
+    dataHandle(req, res, function(data) {
+      // If methodsHandler not found or somehow the methodshandler is not a
+      // function then return a 404
+      if (typeof method.handle === 'undefined') {
+        sendError(res, 404, 'Error HTTP method handler "' + method.name + '" is not found');
+        return;
+      }
 
       // Set fiber scope
       var fiberScope = {
@@ -482,6 +508,9 @@ WebApp.connectHandlers.use(function(req, res, next) {
         // basic auth
         basicAuth: basicAuth,
         authToken: req.headers['x-auth'] || req.query.token
+        // Streaming flags
+        isReadStreaming: false,
+        isWriteStreaming: false,
       };
 
       // Helper functions this scope
@@ -528,7 +557,33 @@ WebApp.connectHandlers.use(function(req, res, next) {
           },
           addHeader: function(key, value) {
             self.headers[key] = value;
-          }
+          },
+          createReadStream: function() {
+            self.isReadStreaming = true;
+            return req;
+          },
+          createWriteStream: function() {
+            self.isWriteStreaming = true;
+            return res;
+          },
+          Error: function(err) {
+
+            if (err instanceof Meteor.Error) {
+              // Return controlled error
+              sendError(res, err.error, err.message);
+            } else if (err instanceof Error) {
+              // Return error trace - this is not intented
+              sendError(res, 503, 'Error in method "' + self.reference + '", Error: ' + (err.stack || err.message) );
+            } else {
+              sendError(res, 503, 'Error in method "' + self.reference + '"' );
+            }
+
+          },
+          // getData: function() {
+          //   // XXX: TODO if we could run the request handler stuff eg.
+          //   // in here in a fiber sync it could be cool - and the user did
+          //   // not have to specify the stream=true flag?
+          // }
         };
 
         var methodCall = self.methodObject[self.method];
@@ -565,17 +620,55 @@ WebApp.connectHandlers.use(function(req, res, next) {
 
           // If OK / 200 then Return the result
           if (self.statusCode === 200) {
+            // Set headers
+            _.each(self.headers, function(value, key) {
+              // If value is defined then set the header, this allows for unsetting
+              // the default content-type
+              if (typeof value !== 'undefined')
+                res.setHeader(key, value);
+            });
+
+            if (self.method === "HEAD") {
+              res.end();
+              return;
+            }
+
+            // Return result
             var resultBuffer = new Buffer(result);
+
             // Check if user wants to overwrite content length for some reason?
             if (typeof self.headers['Content-Length'] === 'undefined') {
               self.headers['Content-Length'] = resultBuffer.length;
             }
-            // Set headers
-            _.each(self.headers, function(value, key) {
-              self.res.setHeader(key, value);
-            });
-            // End response
-            self.res.end(resultBuffer);
+
+            // Check if we allow and have a stream and the user is read streaming
+            // Then
+            var streamsWaiting = 1;
+
+            // We wait until the user has finished reading
+            if (self.isReadStreaming) {
+              // console.log('Read stream');
+              req.on('end', function() {
+                streamsWaiting--;
+                // If no streams are waiting
+                if (streamsWaiting == 0 && !self.isWriteStreaming) {
+                  res.end(resultBuffer);
+                }
+              });
+
+            } else {
+              streamsWaiting--;
+            }
+
+            // We wait until the user has finished writing
+            if (self.isWriteStreaming) {
+              // console.log('Write stream');
+            } else {
+              // If we are done reading the buffer - eg. not streaming
+              if (streamsWaiting == 0) res.end(resultBuffer);
+            }
+
+
           } else {
             // Set headers
             _.each(self.headers, function(value, key) {
@@ -590,6 +683,7 @@ WebApp.connectHandlers.use(function(req, res, next) {
 
         } else {
           sendError(res, 404, 'Service not found');
+
         }
 
 

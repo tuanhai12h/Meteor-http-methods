@@ -37,8 +37,8 @@ HTTP.methods({
 
 Tinytest.add('http-methods - test environment', function(test) {
   test.isTrue(typeof _methodHTTP !== 'undefined', 'test environment not initialized _methodHTTP');
-  test.isTrue(typeof HTTP !== 'undefined', 'test environment not initialized _methodHTTP');
-  test.isTrue(typeof HTTP.methods !== 'undefined', 'test environment not initialized _methodHTTP');
+  test.isTrue(typeof HTTP !== 'undefined', 'test environment not initialized HTTP');
+  test.isTrue(typeof HTTP.methods !== 'undefined', 'test environment not initialized HTTP.methods');
 
 });
 
@@ -52,7 +52,7 @@ Tinytest.add('http-methods - nameFollowsConventions', function(test) {
   test.isFalse(_methodHTTP.nameFollowsConventions(0.1), 'Tested methods naming convention 7');
   test.isFalse(_methodHTTP.nameFollowsConventions(-0.1), 'Tested methods naming convention 8');
 
-  test.isTrue(_methodHTTP.nameFollowsConventions('/test/test'), 'Tested methods naming convention');
+  test.isTrue(_methodHTTP.nameFollowsConventions('/test/test'), 'Tested methods naming convention leading slash');
   test.isTrue(_methodHTTP.nameFollowsConventions('test/test'), 'Tested methods naming convention');
 });
 
@@ -136,7 +136,7 @@ Tinytest.add('http-methods - getMethod', function(test) {
 //Test API:
 //test.isFalse(v, msg)
 //test.isTrue(v, msg)
-//test.equalactual, expected, message, not
+//test.equal(actual, expected, message, not)
 //test.length(obj, len)
 //test.include(s, v)
 //test.isNaN(v, msg)
@@ -151,4 +151,3 @@ Tinytest.add('http-methods - getMethod', function(test) {
 //test.expect_fail()
 //test.ok(doc)
 //test.fail(doc)
-//test.equal(a, b, msg)
